@@ -1,0 +1,179 @@
+# GraphDST Model Configuration
+# Base configuration for Graph-enhanced Dialog State Tracking
+
+model:
+  name: "graphdst"
+  type: "graph_neural_network"
+  
+  # Architecture parameters
+  hidden_dim: 768
+  num_gnn_layers: 3
+  num_attention_heads: 8
+  dropout: 0.1
+  
+  # Text encoder
+  text_encoder: "bert-base-uncased"
+  max_sequence_length: 512
+  
+  # Graph parameters
+  num_domains: 5
+  num_slots: 37
+  categorical_threshold: 50  # Max vocab size for categorical slots
+  
+  # GNN layer configurations
+  schema_gcn:
+    input_dim: 768
+    hidden_dim: 768
+    num_layers: 3
+    dropout: 0.1
+    activation: "relu"
+    
+  cross_domain_gat:
+    input_dim: 768
+    hidden_dim: 768
+    num_heads: 8
+    num_layers: 3
+    dropout: 0.1
+    attention_dropout: 0.1
+    
+  temporal_gru:
+    input_dim: 768
+    hidden_dim: 768
+    num_layers: 2
+    dropout: 0.1
+    bidirectional: false
+
+# Training configuration
+training:
+  # Basic parameters
+  num_epochs: 10
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  
+  # Optimization
+  optimizer:
+    type: "adamw"
+    learning_rate: 2e-5
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1e-8
+  
+  # Learning rate scheduling
+  scheduler:
+    type: "linear_warmup"
+    warmup_steps: 1000
+    warmup_ratio: 0.1
+    
+  # Loss weights for multi-task learning
+  loss_weights:
+    domain: 1.0
+    slot: 1.0
+    value: 1.0
+  
+  # Validation and early stopping
+  eval_steps: 500
+  save_steps: 1000
+  patience: 5
+  metric_for_best_model: "joint_goal_accuracy"
+  greater_is_better: true
+
+# Data configuration
+data:
+  # Paths
+  data_dir: "data"
+  ontology_path: "data/ontology.json"
+  
+  # Splits
+  train_file: "train.json"
+  val_file: "val.json" 
+  test_file: "test.json"
+  
+  # Processing parameters
+  max_history_turns: 3
+  max_utterance_length: 100
+  max_system_response_length: 150
+  
+  # Tokenization
+  tokenizer: "bert-base-uncased"
+  add_special_tokens: true
+  padding: "max_length"
+  truncation: true
+  
+  # Graph construction
+  schema_graph:
+    build_domain_connections: true
+    build_slot_similarities: true
+    build_value_relationships: true
+    
+  dialog_graph:
+    max_turn_connections: 5
+    entity_linking: true
+    coreference_window: 3
+
+# Evaluation configuration
+evaluation:
+  # Metrics to compute
+  metrics:
+    - "joint_goal_accuracy"
+    - "domain_f1"
+    - "slot_f1" 
+    - "value_accuracy"
+    - "turn_accuracy"
+  
+  # Per-domain evaluation
+  per_domain_metrics: true
+  per_slot_metrics: false
+  
+  # Output format
+  save_predictions: true
+  save_attention_weights: true
+
+# Logging and output
+logging:
+  level: "INFO"
+  log_dir: "logs"
+  log_file: "training.log"
+  
+  # Weights & Biases (optional)
+  use_wandb: false
+  wandb_project: "graphdst"
+  wandb_entity: null
+  
+  # TensorBoard (optional)
+  use_tensorboard: true
+  tensorboard_dir: "runs"
+
+# Output and checkpointing
+output:
+  output_dir: "experiments"
+  run_name: "graphdst_base"
+  
+  # Model saving
+  save_model: true
+  save_best_model: true
+  save_last_model: true
+  
+  # Results
+  results_file: "test_results.json"
+  predictions_file: "predictions.json"
+
+# Hardware and performance
+hardware:
+  # Device configuration
+  device: "auto"  # auto, cpu, cuda, mps
+  mixed_precision: false  # Use automatic mixed precision
+  
+  # Memory optimization
+  gradient_checkpointing: false
+  dataloader_num_workers: 4
+  pin_memory: true
+  
+  # Distributed training (future)
+  distributed: false
+  local_rank: -1
+
+# Reproducibility
+seed: 42
+deterministic: true

@@ -1,0 +1,104 @@
+# GraphDST Experimental Configuration
+# Advanced configuration for ablation studies and hyperparameter tuning
+
+# Inherits from base_config.yaml and overrides specific parameters
+
+model:
+  # Larger model variant
+  hidden_dim: 1024
+  num_gnn_layers: 4
+  num_attention_heads: 12
+  
+  # Advanced GNN configurations
+  schema_gcn:
+    hidden_dim: 1024
+    use_residual_connections: true
+    use_layer_norm: true
+    
+  cross_domain_gat:
+    hidden_dim: 1024
+    num_heads: 12
+    use_edge_features: true
+    concat_heads: true
+    
+  temporal_gru:
+    hidden_dim: 1024
+    num_layers: 3
+    bidirectional: true
+
+training:
+  # Extended training
+  num_epochs: 20
+  batch_size: 8  # Smaller batch size for larger model
+  gradient_accumulation_steps: 4  # Effective batch size = 8 * 4 = 32
+  
+  # Advanced optimization
+  optimizer:
+    learning_rate: 1e-5  # Lower learning rate for larger model
+    weight_decay: 0.02
+    
+  scheduler:
+    type: "cosine_annealing"
+    warmup_steps: 2000
+    min_lr: 1e-7
+    
+  # Loss configuration
+  loss_weights:
+    domain: 0.5
+    slot: 1.0
+    value: 2.0  # Higher weight for value prediction
+    
+  # Advanced regularization
+  dropout_schedule: "linear_decay"  # Decay dropout during training
+  label_smoothing: 0.1
+
+data:
+  # Extended context
+  max_history_turns: 5
+  max_sequence_length: 768  # Longer sequences
+  
+  # Data augmentation
+  augmentation:
+    enabled: true
+    paraphrase_probability: 0.1
+    entity_replacement_probability: 0.05
+    
+  # Advanced graph construction
+  schema_graph:
+    use_ontology_embeddings: true
+    learn_edge_weights: true
+    
+  dialog_graph:
+    use_speaker_embeddings: true
+    temporal_decay_factor: 0.9
+
+evaluation:
+  # Comprehensive evaluation
+  metrics:
+    - "joint_goal_accuracy"
+    - "slot_turn_accuracy"
+    - "domain_f1"
+    - "slot_f1"
+    - "value_accuracy"
+    - "belief_state_edit_distance"
+    
+  per_domain_metrics: true
+  per_slot_metrics: true
+  error_analysis: true
+
+logging:
+  use_wandb: true
+  wandb_project: "graphdst_experiments"
+  
+  # Advanced logging
+  log_gradients: true
+  log_attention_weights: true
+  log_graph_statistics: true
+
+output:
+  run_name: "graphdst_large_advanced"
+  save_intermediate_models: true  # Save models at multiple checkpoints
+
+hardware:
+  mixed_precision: true
+  gradient_checkpointing: true

@@ -1,0 +1,61 @@
+# GraphDST Development Configuration
+# Lightweight configuration for development and debugging
+
+model:
+  # Smaller model for faster development
+  hidden_dim: 256
+  num_gnn_layers: 2
+  num_attention_heads: 4
+  dropout: 0.2
+  
+  schema_gcn:
+    hidden_dim: 256
+    num_layers: 2
+    
+  cross_domain_gat:
+    hidden_dim: 256
+    num_heads: 4
+    num_layers: 2
+    
+  temporal_gru:
+    hidden_dim: 256
+    num_layers: 1
+
+training:
+  # Fast training for development
+  num_epochs: 3
+  batch_size: 4
+  
+  optimizer:
+    learning_rate: 5e-5
+    
+  scheduler:
+    warmup_steps: 100
+    
+  # Frequent evaluation for debugging
+  eval_steps: 50
+  save_steps: 100
+  patience: 2
+
+data:
+  # Smaller data processing
+  max_history_turns: 2
+  max_sequence_length: 256
+  
+  # Use subset of data for development
+  train_subset_size: 1000  # Use only first 1000 examples
+  val_subset_size: 100
+  test_subset_size: 100
+
+logging:
+  level: "DEBUG"
+  use_tensorboard: false
+  use_wandb: false
+
+output:
+  run_name: "graphdst_dev"
+  save_model: false  # Don't save models during development
+
+hardware:
+  device: "cpu"  # Use CPU for development if no GPU available
+  dataloader_num_workers: 1
