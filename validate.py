@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List
 from tqdm import tqdm
+from datetime import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -27,7 +28,7 @@ from collections import defaultdict
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from models.graphdst import GraphDSTModel, GraphDSTConfig
-from train import MultiWOZDataset, setup_logging
+from train import MultiWOZDataset, setup_logging, collate_fn
 
 
 # ============================================================================
@@ -172,10 +173,217 @@ class DSTMetrics:
 
 
 # ============================================================================
+# Delta Accuracy Computation
+# ============================================================================
+def compute_delta_accuracy(predictions):
+    """Compute delta-based accuracy metrics"""
+    
+    total_turns = len(predictions)
+    perfect_deltas = 0
+    
+    # Slot-level metrics
+    slot_correct = defaultdict(int)
+    slot_total = defaultdict(int)
+    slot_fp = defaultdict(int)
+    slot_fn = defaultdict(int)
+    
+    for ex in predictions:
+        true_delta = ex.get('true_belief_state_delta', {})
+        pred_delta = ex.get('predicted_belief_state_delta', {})
+        
+        # Check if delta is perfect
+        is_perfect = (set(true_delta.keys()) == set(pred_delta.keys()) and
+                     all(true_delta.get(k) == pred_delta.get(k) for k in true_delta.keys()))
+        
+        if is_perfect:
+            perfect_deltas += 1
+        
+        # All slots mentioned
+        all_slots = set(list(true_delta.keys()) + list(pred_delta.keys()))
+        
+        for slot in all_slots:
+            true_val = true_delta.get(slot)
+            pred_val = pred_delta.get(slot)
+            
+            if true_val is not None:
+                slot_total[slot] += 1
+                
+                if pred_val == true_val:
+                    slot_correct[slot] += 1
+                elif pred_val is None:
+                    slot_fn[slot] += 1
+            else:
+                slot_fp[slot] += 1
+    
+    return {
+        'total_turns': total_turns,
+        'perfect_deltas': perfect_deltas,
+        'delta_accuracy': perfect_deltas / max(total_turns, 1),
+        'slot_correct': dict(slot_correct),
+        'slot_total': dict(slot_total),
+        'slot_fp': dict(slot_fp),
+        'slot_fn': dict(slot_fn)
+    }
+
+
+# ============================================================================
+# Prediction Extraction for Debugging
+# ============================================================================
+def extract_predictions(predictions: Dict, labels: Dict, batch: Dict, 
+                       domains: List[str], slots: List[str], device,
+                       tokenizer=None, val_dataset=None, batch_idx: int = 0) -> List[Dict]:
+    """
+    Extract predictions in human-readable format for debugging
+    
+    Returns:
+        List of dictionaries containing predictions and labels for each example
+    """
+    batch_size = predictions['domains'].size(0)
+    batch_predictions = []
+    
+    # Get input text
+    input_ids = batch['input_ids'].cpu()
+    
+    for i in range(batch_size):
+        # Decode input text
+        input_text = ""
+        if tokenizer is not None:
+            tokens = input_ids[i]
+            input_text = tokenizer.decode(tokens, skip_special_tokens=True)
+        
+        # Get raw data if available
+        raw_data = batch.get('raw_data', [{}] * batch_size)[i]
+        
+        example = {
+            'example_id': batch_idx * batch_size + i,
+            'dialogue_id': raw_data.get('dialogue_id', 'unknown'),
+            'turn_id': raw_data.get('turn_id', -1),
+            'input_text': input_text,
+            'current_utterance': raw_data.get('current_utterance', ''),
+            'belief_state_delta': raw_data.get('belief_state_delta', {}),  # Target: delta only
+            'belief_state_full': raw_data.get('belief_state_full', {}),    # Full state for reference
+            'predictions': {},
+            'labels': {},
+            'correct': {}
+        }
+        
+        # True belief state DELTA from labels (what changed in this turn)
+        true_belief_delta = {}
+        predicted_belief_delta = {}
+        
+        # Domain predictions
+        domain_probs = torch.sigmoid(predictions['domains'][i]).cpu().numpy()
+        domain_preds = (domain_probs > 0.5).astype(int)
+        domain_labels = labels['domain_labels'][i].cpu().numpy()
+        
+        example['predictions']['domains'] = {
+            domain: {
+                'predicted': bool(domain_preds[j]),
+                'probability': float(domain_probs[j]),
+                'label': bool(domain_labels[j]),
+                'correct': bool(domain_preds[j] == domain_labels[j])
+            }
+            for j, domain in enumerate(domains)
+        }
+        
+        # Slot predictions
+        example['predictions']['slots'] = {}
+        for slot in slots:
+            if f'{slot}_active' in labels:
+                slot_logits = predictions['slot_activations'][slot][i]
+                slot_pred = torch.argmax(slot_logits).item()
+                slot_prob = torch.softmax(slot_logits, dim=-1)[1].item()
+                slot_label = labels[f'{slot}_active'][i].item()
+                
+                slot_info = {
+                    'predicted_active': bool(slot_pred),
+                    'probability': float(slot_prob),
+                    'label_active': bool(slot_label),
+                    'correct': bool(slot_pred == slot_label)
+                }
+                
+                # Get value vocabulary if available
+                value_vocab = None
+                if val_dataset is not None:
+                    value_vocab = val_dataset.value_vocabs.get(slot)
+                
+                # Value prediction (for categorical slots)
+                if slot_pred == 1 and slot in predictions.get('values', {}):
+                    value_logits = predictions['values'][slot][i]
+                    value_pred_idx = torch.argmax(value_logits).item()
+                    value_probs = torch.softmax(value_logits, dim=-1)
+                    top_k = 3
+                    top_values = torch.topk(value_probs, min(top_k, len(value_probs)))
+                    
+                    # Convert indices to actual values if vocab available
+                    idx2value = None
+                    if value_vocab is not None:
+                        idx2value = {v: k for k, v in value_vocab.items()}
+                    
+                    slot_info['value_prediction'] = {
+                        'predicted_idx': int(value_pred_idx),
+                        'predicted_value': idx2value[value_pred_idx] if idx2value else None,
+                        'top_predictions': [
+                            {
+                                'idx': int(idx),
+                                'value': idx2value[int(idx)] if idx2value else None,
+                                'probability': float(prob)
+                            }
+                            for idx, prob in zip(top_values.indices.tolist(), 
+                                                top_values.values.tolist())
+                        ]
+                    }
+                    
+                    # Add to predicted belief state DELTA
+                    if idx2value and value_pred_idx in idx2value:
+                        predicted_belief_delta[slot] = idx2value[value_pred_idx]
+                    
+                    # Add label if available
+                    value_label_key = f'{slot}_value'
+                    if value_label_key in labels:
+                        value_label_idx = labels[value_label_key][i].item()
+                        slot_info['value_prediction']['label_idx'] = int(value_label_idx)
+                        slot_info['value_prediction']['label_value'] = idx2value[value_label_idx] if idx2value and value_label_idx in idx2value else None
+                        slot_info['value_prediction']['correct'] = bool(
+                            value_pred_idx == value_label_idx
+                        )
+                        
+                        # Add to true belief state DELTA
+                        if idx2value and value_label_idx in idx2value:
+                            true_belief_delta[slot] = idx2value[value_label_idx]
+                
+                # If label is active, add to true belief DELTA (even if we didn't predict it)
+                elif slot_label == 1:
+                    value_label_key = f'{slot}_value'
+                    if value_label_key in labels and value_vocab is not None:
+                        value_label_idx = labels[value_label_key][i].item()
+                        idx2value = {v: k for k, v in value_vocab.items()}
+                        if value_label_idx in idx2value:
+                            true_belief_delta[slot] = idx2value[value_label_idx]
+                
+                example['predictions']['slots'][slot] = slot_info
+        
+        # Add belief state DELTAS for comparison
+        example['true_belief_state_delta'] = true_belief_delta
+        example['predicted_belief_state_delta'] = predicted_belief_delta
+        
+        # Check if prediction is perfect
+        example['is_perfect'] = (
+            all(info['correct'] for info in example['predictions']['domains'].values()) and
+            all(info['correct'] for info in example['predictions']['slots'].values())
+        )
+        
+        batch_predictions.append(example)
+    
+    return batch_predictions
+
+
+# ============================================================================
 # Validation Function
 # ============================================================================
 def validate(model: nn.Module, val_loader: DataLoader, device, logger, 
-            domains: List[str], slots: List[str]):
+            domains: List[str], slots: List[str], save_predictions: bool = True,
+            tokenizer=None, val_dataset=None):
     """Run validation"""
     model.eval()
     
@@ -185,6 +393,9 @@ def validate(model: nn.Module, val_loader: DataLoader, device, logger,
     total_value_loss = 0
     
     metrics_calculator = DSTMetrics(domains, slots)
+    
+    # Store predictions for debugging
+    all_predictions = []
     
     progress_bar = tqdm(val_loader, desc="Validating")
     
@@ -220,6 +431,14 @@ def validate(model: nn.Module, val_loader: DataLoader, device, logger,
             belief_states = [{}] * input_ids.size(0)
             metrics_calculator.update(predictions, labels, belief_states)
             
+            # Save predictions for debugging
+            if save_predictions:
+                batch_predictions = extract_predictions(
+                    predictions, labels, batch, domains, slots, device,
+                    tokenizer=tokenizer, val_dataset=val_dataset, batch_idx=batch_idx
+                )
+                all_predictions.extend(batch_predictions)
+            
             # Update progress bar
             progress_bar.set_postfix({
                 'loss': f"{losses['total'].item():.4f}"
@@ -240,7 +459,7 @@ def validate(model: nn.Module, val_loader: DataLoader, device, logger,
     # Combine stats
     all_stats = {**loss_stats, **eval_metrics}
     
-    return all_stats
+    return all_stats, all_predictions
 
 
 # ============================================================================
@@ -256,14 +475,16 @@ def main():
                        help='Validation file name')
     parser.add_argument('--batch_size', type=int, default=16,
                        help='Batch size')
-    parser.add_argument('--output_dir', type=str, default='experiments/val_results',
-                       help='Output directory for results')
+    parser.add_argument('--output_dir', type=str, default='experiments/evaluations',
+                       help='Base output directory for results')
     parser.add_argument('--device', type=str, default='auto',
                        help='Device (auto/cpu/cuda/mps)')
     args = parser.parse_args()
     
-    # Create output directory
-    output_dir = Path(args.output_dir)
+    # Create output directory with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    checkpoint_name = Path(args.checkpoint).parent.name
+    output_dir = Path(args.output_dir) / f"{checkpoint_name}_eval_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Setup logging
@@ -317,7 +538,8 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0
+        num_workers=0,
+        collate_fn=collate_fn
     )
     
     # Create model
@@ -342,9 +564,12 @@ def main():
     logger.info("Starting Validation")
     logger.info("="*70 + "\n")
     
-    results = validate(
+    results, predictions = validate(
         model, val_loader, device, logger,
-        val_dataset.domains, val_dataset.slots
+        val_dataset.domains, val_dataset.slots,
+        save_predictions=True,
+        tokenizer=tokenizer,
+        val_dataset=val_dataset
     )
     
     # Log results
@@ -366,24 +591,91 @@ def main():
     for domain, metrics in results['domain_metrics'].items():
         logger.info(f"  {domain:15s}: P={metrics['precision']:.4f} R={metrics['recall']:.4f} F1={metrics['f1']:.4f}")
     
-    # Save results to file
-    results_file = output_dir / 'validation_results.json'
-    with open(results_file, 'w') as f:
-        # Convert to JSON-serializable format
-        json_results = {
-            'loss': results['loss'],
-            'domain_loss': results['domain_loss'],
-            'slot_loss': results['slot_loss'],
-            'value_loss': results['value_loss'],
-            'joint_goal_accuracy': results['joint_goal_accuracy'],
-            'avg_domain_f1': results['avg_domain_f1'],
-            'avg_slot_f1': results['avg_slot_f1'],
-            'domain_metrics': results['domain_metrics'],
-            'slot_metrics': {k: v for k, v in list(results['slot_metrics'].items())[:10]}  # Top 10 slots
-        }
-        json.dump(json_results, f, indent=2)
+    # Compute delta accuracy
+    logger.info(f"\nComputing Delta Accuracy...")
+    delta_stats = compute_delta_accuracy(predictions)
+    logger.info(f"  Delta Accuracy: {delta_stats['delta_accuracy']*100:.2f}%")
     
-    logger.info(f"\nResults saved to: {results_file}")
+    # Prepare summary with all DST metrics
+    summary = {
+        'evaluation_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'checkpoint': str(args.checkpoint),
+        'validation_file': args.val_file,
+        'num_examples': len(predictions),
+        
+        # Loss statistics
+        'loss': {
+            'total': results['loss'],
+            'domain': results['domain_loss'],
+            'slot': results['slot_loss'],
+            'value': results['value_loss']
+        },
+        
+        # Main accuracy metrics
+        'accuracy': {
+            'joint_goal_accuracy': results['joint_goal_accuracy'],
+            'delta_accuracy': delta_stats['delta_accuracy'],
+            'avg_domain_f1': results['avg_domain_f1'],
+            'avg_slot_f1': results['avg_slot_f1']
+        },
+        
+        # Per-domain metrics
+        'domain_metrics': results['domain_metrics'],
+        
+        # Per-slot metrics (all slots)
+        'slot_metrics': results['slot_metrics'],
+        
+        # Delta-based slot metrics
+        'delta_slot_metrics': {
+            slot: {
+                'correct': delta_stats['slot_correct'].get(slot, 0),
+                'total': delta_stats['slot_total'].get(slot, 0),
+                'accuracy': delta_stats['slot_correct'].get(slot, 0) / max(delta_stats['slot_total'].get(slot, 1), 1),
+                'false_positives': delta_stats['slot_fp'].get(slot, 0),
+                'false_negatives': delta_stats['slot_fn'].get(slot, 0)
+            }
+            for slot in set(list(delta_stats['slot_correct'].keys()) + 
+                          list(delta_stats['slot_fp'].keys()) + 
+                          list(delta_stats['slot_fn'].keys()))
+        }
+    }
+    
+    # Save summary
+    summary_file = output_dir / 'summary.json'
+    logger.info(f"\nSaving summary to: {summary_file}")
+    with open(summary_file, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    
+    # Prepare readable predictions
+    readable_predictions = []
+    for ex in predictions:
+        true_delta = ex.get('true_belief_state_delta', {})
+        pred_delta = ex.get('predicted_belief_state_delta', {})
+        
+        # Skip if both are empty
+        if not true_delta and not pred_delta:
+            continue
+        
+        readable_ex = {
+            'dialogue_id': ex.get('dialogue_id', 'unknown'),
+            'turn_id': ex.get('turn_id', -1),
+            'utterance': ex.get('current_utterance', ''),
+            'predicted': pred_delta,
+            'ground_truth': true_delta
+        }
+        readable_predictions.append(readable_ex)
+    
+    # Save predictions
+    predictions_file = output_dir / 'predictions.json'
+    logger.info(f"Saving {len(readable_predictions)} predictions to: {predictions_file}")
+    with open(predictions_file, 'w', encoding='utf-8') as f:
+        json.dump(readable_predictions, f, indent=2, ensure_ascii=False)
+    
+    logger.info("\n" + "="*70)
+    logger.info("Evaluation completed successfully!")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info("  - summary.json: All DST metrics")
+    logger.info("  - predictions.json: Prediction history")
     logger.info("="*70)
 
 

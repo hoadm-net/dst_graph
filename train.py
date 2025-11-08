@@ -22,8 +22,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import get_linear_schedule_with_warmup
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 import yaml
 
 # Add src to path
@@ -122,8 +121,9 @@ class MultiWOZDataset(Dataset):
                 # Full input text
                 input_text = f"{history_text} [SEP] {current_utterance}"
                 
-                # Belief state
-                belief_state = turn.get('belief_state', {})
+                # Use belief_state_delta for training (changes in this turn only)
+                belief_state_delta = turn.get('belief_state_delta', {})
+                belief_state_full = turn.get('belief_state', {})
                 
                 # Create example
                 example = {
@@ -131,7 +131,8 @@ class MultiWOZDataset(Dataset):
                     'turn_id': turn['turn_id'],
                     'input_text': input_text,
                     'current_utterance': current_utterance,
-                    'belief_state': belief_state
+                    'belief_state': belief_state_delta,  # Use delta for labels
+                    'belief_state_full': belief_state_full  # Keep full for reference
                 }
                 
                 examples.append(example)
@@ -226,8 +227,69 @@ class MultiWOZDataset(Dataset):
             'attention_mask': encoding['attention_mask'].squeeze(0),
             'labels': labels,
             'dialogue_id': example['dialogue_id'],
-            'turn_id': example['turn_id']
+            'turn_id': example['turn_id'],
+            'current_utterance': example['current_utterance'],
+            'input_text': example['input_text'],
+            'belief_state_delta': example['belief_state'],  # This is delta
+            'belief_state_full': example['belief_state_full']
         }
+
+
+def collate_fn(batch):
+    """Custom collate function to handle varying label keys"""
+    # Collate input_ids and attention_mask normally
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    attention_mask = torch.stack([item['attention_mask'] for item in batch])
+    
+    # Collect all possible label keys
+    all_label_keys = set()
+    for item in batch:
+        all_label_keys.update(item['labels'].keys())
+    
+    # Collate labels - use None for missing keys
+    labels = {}
+    for key in all_label_keys:
+        # Get all values for this key (None if missing)
+        values = []
+        for item in batch:
+            if key in item['labels']:
+                values.append(item['labels'][key])
+            else:
+                # Create a dummy tensor with -100 (ignore index)
+                if 'value' in key:
+                    values.append(torch.tensor(-100, dtype=torch.long))
+                elif 'active' in key:
+                    values.append(torch.tensor(-100, dtype=torch.long))
+                else:  # domain_labels
+                    values.append(torch.zeros_like(batch[0]['labels']['domain_labels']))
+        
+        if values:
+            labels[key] = torch.stack(values)
+    
+    # Collect metadata and raw data for debugging
+    dialogue_ids = [item['dialogue_id'] for item in batch]
+    turn_ids = [item['turn_id'] for item in batch]
+    
+    # Store raw data for validation/debugging
+    raw_data = []
+    for item in batch:
+        raw_data.append({
+            'dialogue_id': item['dialogue_id'],
+            'turn_id': item['turn_id'],
+            'current_utterance': item.get('current_utterance', ''),
+            'input_text': item.get('input_text', ''),
+            'belief_state_delta': item.get('belief_state', {}),  # This is actually delta
+            'belief_state_full': item.get('belief_state_full', {})
+        })
+    
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'labels': labels,
+        'dialogue_id': dialogue_ids,
+        'turn_id': turn_ids,
+        'raw_data': raw_data
+    }
 
 
 # ============================================================================
@@ -392,7 +454,8 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0  # Use 0 for macOS compatibility
+        num_workers=0,  # Use 0 for macOS compatibility
+        collate_fn=collate_fn
     )
     
     # Create model
